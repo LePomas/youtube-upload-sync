@@ -131,6 +131,14 @@ def parse_args() -> argparse.Namespace:
         help="Try uploading even if the saved 24-hour upload-limit wait has not passed.",
     )
     parser.add_argument(
+        "--wait-until-upload-limit-reset",
+        action="store_true",
+        help=(
+            "When an upload-limit wait is active, sleep until the retry time and "
+            "continue without prompting. Useful for non-interactive runs."
+        ),
+    )
+    parser.add_argument(
         "--no-recursive",
         action="store_true",
         help="Do not recurse into directories.",
@@ -593,7 +601,7 @@ def main() -> int:
         active_limit = get_active_upload_limit(state)
         if active_limit:
             print_upload_limit_summary(active_limit)
-            if not prompt_auto_retry():
+            if not args.wait_until_upload_limit_reset and not prompt_auto_retry():
                 return 2
             wait_until_retry_time(active_limit)
             state.pop("upload_limit", None)

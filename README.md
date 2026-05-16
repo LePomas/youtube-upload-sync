@@ -117,6 +117,12 @@ If the saved wait is still active during an interactive run, the CLI asks if you
 want it to wait until the retry time and continue automatically. In
 non-interactive runs, it prints the retry time and exits instead of waiting.
 
+For non-interactive scripts that should wait and continue automatically, use:
+
+```bash
+uv run youtube-upload-sync --wait-until-upload-limit-reset --check-existing-account --limit 5 /path/to/videos
+```
+
 If you want to try anyway:
 
 ```bash
