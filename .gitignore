@@ -16,6 +16,7 @@ dist/
 # Local logs and scratch files
 *.log
 .DS_Store
+AGENTS.md
 .agents/
 .codex/
 
