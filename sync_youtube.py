@@ -14,7 +14,8 @@ import mimetypes
 import pathlib
 import sys
 import time
-from typing import Any
+from contextlib import nullcontext
+from typing import Any, Callable
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -136,6 +137,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "When an upload-limit wait is active, sleep until the retry time and "
             "continue without prompting. Useful for non-interactive runs."
+        ),
+    )
+    parser.add_argument(
+        "--progress",
+        choices=("auto", "rich", "plain"),
+        default="auto",
+        help=(
+            "Progress display mode. Default: auto, which uses Rich in interactive "
+            "terminals and plain logs otherwise."
         ),
     )
     parser.add_argument(
@@ -410,6 +420,105 @@ def wait_until_retry_time(active_limit: dict[str, Any]) -> None:
         time.sleep(remaining_seconds)
 
 
+def resolve_progress_mode(requested: str, stream=None) -> str:
+    stream = sys.stdout if stream is None else stream
+    if requested == "auto":
+        return "rich" if stream.isatty() else "plain"
+    return requested
+
+
+class PlainUploadProgress:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    def status(self, message: str):
+        print(message)
+        return nullcontext()
+
+    def start_upload(self, index: int, total: int, path: pathlib.Path) -> None:
+        print(f"[{index}/{total}] uploading {path}")
+
+    def update_upload(self, progress: float) -> None:
+        print(f"  progress: {progress * 100:.1f}%")
+
+    def finish_upload(self, video_id: str) -> None:
+        print(f"  uploaded: https://youtu.be/{video_id}")
+
+
+class RichUploadProgress:
+    def __init__(self):
+        from rich.console import Console
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            SpinnerColumn,
+            TaskProgressColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
+
+        self.console = Console()
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=self.console,
+        )
+        self.upload_task = None
+
+    def __enter__(self):
+        self.progress.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.progress.stop()
+
+    def status(self, message: str):
+        return RichProgressStatus(self.progress, message)
+
+    def start_upload(self, index: int, total: int, path: pathlib.Path) -> None:
+        if self.upload_task is not None:
+            self.progress.remove_task(self.upload_task)
+        self.upload_task = self.progress.add_task(
+            f"[{index}/{total}] {path.name}", total=100
+        )
+
+    def update_upload(self, progress: float) -> None:
+        if self.upload_task is not None:
+            self.progress.update(self.upload_task, completed=progress * 100)
+
+    def finish_upload(self, video_id: str) -> None:
+        if self.upload_task is not None:
+            self.progress.update(self.upload_task, completed=100)
+        self.console.print(f"  uploaded: https://youtu.be/{video_id}")
+
+
+def make_upload_progress(mode: str):
+    if mode == "rich":
+        return RichUploadProgress()
+    return PlainUploadProgress()
+
+
+class RichProgressStatus:
+    def __init__(self, progress, message: str):
+        self.progress = progress
+        self.message = message
+        self.task = None
+
+    def __enter__(self):
+        self.task = self.progress.add_task(self.message, total=None)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self.task is not None:
+            self.progress.remove_task(self.task)
+
+
 def refresh_and_print_upload_limit_status(youtube, state: dict[str, Any]) -> bool:
     account_videos = list_account_videos_by_title(youtube)
     upload_limit = refresh_upload_limit_from_account(state, account_videos)
@@ -445,6 +554,7 @@ def upload_video(
     tags: list[str],
     category_id: str,
     privacy: str,
+    progress_callback: Callable[[float], None] | None = None,
 ) -> str:
     from googleapiclient.errors import HttpError, ResumableUploadError
     from googleapiclient.http import MediaFileUpload
@@ -484,7 +594,11 @@ def upload_video(
                 continue
             raise
         if status:
-            print(f"  progress: {status.progress() * 100:.1f}%")
+            progress = status.progress()
+            if progress_callback:
+                progress_callback(progress)
+            else:
+                print(f"  progress: {progress * 100:.1f}%")
 
     video_id = response.get("id")
     if not video_id:
@@ -617,116 +731,124 @@ def main() -> int:
         return 0
 
     youtube = get_youtube_client(secrets_path, token_path)
-    account_videos = None
+    progress_mode = resolve_progress_mode(args.progress)
 
-    active_limit = get_active_upload_limit(state)
-    if active_limit and not args.ignore_upload_limit_wait:
-        account_videos = list_account_videos_by_title(youtube)
-        refresh_upload_limit_from_account(state, account_videos)
-        save_state(state_path, state)
+    with make_upload_progress(progress_mode) as progress:
+        account_videos = None
+
         active_limit = get_active_upload_limit(state)
-        if active_limit:
-            print_upload_limit_summary(active_limit)
-            if not args.wait_until_upload_limit_reset and not prompt_auto_retry():
-                return 2
-            wait_until_retry_time(active_limit)
-            state.pop("upload_limit", None)
+        if active_limit and not args.ignore_upload_limit_wait:
+            with progress.status("refreshing upload-limit status..."):
+                account_videos = list_account_videos_by_title(youtube)
+            refresh_upload_limit_from_account(state, account_videos)
             save_state(state_path, state)
+            active_limit = get_active_upload_limit(state)
+            if active_limit:
+                print_upload_limit_summary(active_limit)
+                if not args.wait_until_upload_limit_reset and not prompt_auto_retry():
+                    return 2
+                with progress.status("waiting for upload-limit reset..."):
+                    wait_until_retry_time(active_limit)
+                state.pop("upload_limit", None)
+                save_state(state_path, state)
 
-    if args.check_existing_account and not args.force:
-        print("checking existing videos in your YouTube account...")
-        if account_videos is None:
-            account_videos = list_account_videos_by_title(youtube)
-        still_pending = []
-        skipped = 0
-        for path in pending:
-            title = format_title(args.title_template, path)
-            matches = account_videos.get(title, [])
-            if matches:
-                match = matches[0]
-                mark_existing_upload(state, path, title, match)
-                skipped += 1
-                print(f"  already exists: {path} -> https://youtu.be/{match['video_id']}")
-            else:
-                still_pending.append(path)
-
-        if skipped:
-            save_state(state_path, state)
-            print(f"skipped {skipped} existing account video(s)")
-        pending = still_pending
-
-    if args.limit is not None:
-        pending = pending[: args.limit]
-
-    print(f"{len(pending)} video(s) ready to upload")
-    if not pending:
-        return 0
-
-    for index, path in enumerate(pending, start=1):
-        title = format_title(args.title_template, path)
-        print(f"[{index}/{len(pending)}] uploading {path}")
-        try:
-            video_id = upload_video(
-                youtube=youtube,
-                path=path,
-                title=title,
-                description=args.description,
-                tags=tags,
-                category_id=args.category_id,
-                privacy=args.privacy,
-            )
-        except UploadLimitExceeded as error:
-            last_upload_at = None
-            if account_videos is None:
-                try:
+        if args.check_existing_account and not args.force:
+            with progress.status("checking existing videos in your YouTube account..."):
+                if account_videos is None:
                     account_videos = list_account_videos_by_title(youtube)
-                except Exception as account_error:
+            still_pending = []
+            skipped = 0
+            for path in pending:
+                title = format_title(args.title_template, path)
+                matches = account_videos.get(title, [])
+                if matches:
+                    match = matches[0]
+                    mark_existing_upload(state, path, title, match)
+                    skipped += 1
                     print(
-                        "warning: could not refresh latest account upload after "
-                        f"limit error: {account_error}",
+                        f"  already exists: {path} -> https://youtu.be/{match['video_id']}"
+                    )
+                else:
+                    still_pending.append(path)
+
+            if skipped:
+                save_state(state_path, state)
+                print(f"skipped {skipped} existing account video(s)")
+            pending = still_pending
+
+        if args.limit is not None:
+            pending = pending[: args.limit]
+
+        print(f"{len(pending)} video(s) ready to upload")
+        if not pending:
+            return 0
+
+        for index, path in enumerate(pending, start=1):
+            title = format_title(args.title_template, path)
+            progress.start_upload(index, len(pending), path)
+            try:
+                video_id = upload_video(
+                    youtube=youtube,
+                    path=path,
+                    title=title,
+                    description=args.description,
+                    tags=tags,
+                    category_id=args.category_id,
+                    privacy=args.privacy,
+                    progress_callback=progress.update_upload,
+                )
+            except UploadLimitExceeded as error:
+                last_upload_at = None
+                if account_videos is None:
+                    try:
+                        account_videos = list_account_videos_by_title(youtube)
+                    except Exception as account_error:
+                        print(
+                            "warning: could not refresh latest account upload after "
+                            f"limit error: {account_error}",
+                            file=sys.stderr,
+                        )
+                if account_videos is not None:
+                    last_upload_at = latest_account_upload_at(account_videos)
+                upload_limit = record_upload_limit(
+                    state, last_account_upload_at=last_upload_at
+                )
+                save_state(state_path, state)
+                print(f"upload stopped: {error}", file=sys.stderr)
+                if upload_limit.get("retry_after"):
+                    retry_after = parse_datetime(upload_limit["retry_after"]).astimezone()
+                    remaining = format_duration(
+                        (
+                            parse_datetime(upload_limit["retry_after"]) - utcnow()
+                        ).total_seconds()
+                    )
+                    print(
+                        f"estimated wait: about {remaining}; try again after "
+                        f"{retry_after.strftime('%Y-%m-%d %H:%M:%S %Z')}",
                         file=sys.stderr,
                     )
-            if account_videos is not None:
-                last_upload_at = latest_account_upload_at(account_videos)
-            upload_limit = record_upload_limit(
-                state, last_account_upload_at=last_upload_at
-            )
+                else:
+                    print(
+                        "no active wait estimate saved; latest account upload is not "
+                        "inside a 24-hour window",
+                        file=sys.stderr,
+                    )
+                return 2
+
+            if args.playlist_id:
+                add_to_playlist(youtube, args.playlist_id, video_id)
+
+            stat = path.stat()
+            state["uploaded"][file_key(path)] = {
+                "video_id": video_id,
+                "title": title,
+                "uploaded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "size": stat.st_size,
+                "mtime": int(stat.st_mtime),
+                "privacy": args.privacy,
+            }
             save_state(state_path, state)
-            print(f"upload stopped: {error}", file=sys.stderr)
-            if upload_limit.get("retry_after"):
-                retry_after = parse_datetime(upload_limit["retry_after"]).astimezone()
-                remaining = format_duration(
-                    (
-                        parse_datetime(upload_limit["retry_after"]) - utcnow()
-                    ).total_seconds()
-                )
-                print(
-                    f"estimated wait: about {remaining}; try again after "
-                    f"{retry_after.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    "no active wait estimate saved; latest account upload is not "
-                    "inside a 24-hour window",
-                    file=sys.stderr,
-                )
-            return 2
-
-        if args.playlist_id:
-            add_to_playlist(youtube, args.playlist_id, video_id)
-
-        stat = path.stat()
-        state["uploaded"][file_key(path)] = {
-            "video_id": video_id,
-            "title": title,
-            "uploaded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "size": stat.st_size,
-            "mtime": int(stat.st_mtime),
-            "privacy": args.privacy,
-        }
-        save_state(state_path, state)
-        print(f"  uploaded: https://youtu.be/{video_id}")
+            progress.finish_upload(video_id)
 
     return 0
 

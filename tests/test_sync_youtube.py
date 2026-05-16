@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -98,6 +99,58 @@ class SyncYoutubeTests(unittest.TestCase):
         self.assertTrue(sync_youtube.is_upload_limit_error(Exception("quotaExceeded")))
         self.assertFalse(sync_youtube.is_upload_limit_error(Exception("dailyLimitExceeded")))
 
+    def test_resolve_progress_mode_uses_tty_for_auto(self):
+        self.assertEqual(
+            sync_youtube.resolve_progress_mode("auto", FakeStream(is_tty=True)),
+            "rich",
+        )
+        self.assertEqual(
+            sync_youtube.resolve_progress_mode("auto", FakeStream(is_tty=False)),
+            "plain",
+        )
+        self.assertEqual(
+            sync_youtube.resolve_progress_mode("plain", FakeStream(is_tty=True)),
+            "plain",
+        )
+
+    def test_rich_upload_progress_uses_rich_renderer(self):
+        console_module = types.ModuleType("rich.console")
+        progress_module = types.ModuleType("rich.progress")
+        fake_progress = FakeRichProgress
+        console_module.Console = FakeRichConsole
+        progress_module.Progress = fake_progress
+        progress_module.BarColumn = FakeRichColumn
+        progress_module.SpinnerColumn = FakeRichColumn
+        progress_module.TaskProgressColumn = FakeRichColumn
+        progress_module.TextColumn = FakeRichColumn
+        progress_module.TimeElapsedColumn = FakeRichColumn
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "rich": types.ModuleType("rich"),
+                "rich.console": console_module,
+                "rich.progress": progress_module,
+            },
+        ):
+            progress = sync_youtube.make_upload_progress("rich")
+            with progress as active:
+                with active.status("checking..."):
+                    pass
+                active.start_upload(1, 2, pathlib.Path("/tmp/GH010001.MP4"))
+                active.update_upload(0.5)
+                active.start_upload(2, 2, pathlib.Path("/tmp/GH010002.MP4"))
+                active.finish_upload("video-2")
+
+        self.assertTrue(progress.progress.started)
+        self.assertTrue(progress.progress.stopped)
+        self.assertEqual(progress.progress.removed, [1, 2])
+        self.assertEqual(
+            progress.progress.updates,
+            [(2, {"completed": 50.0}), (3, {"completed": 100})],
+        )
+        self.assertEqual(progress.console.lines, ["  uploaded: https://youtu.be/video-2"])
+
     def test_list_account_videos_by_title_handles_pages(self):
         youtube = FakeYoutube(
             pages=[
@@ -185,6 +238,53 @@ class SyncYoutubeTests(unittest.TestCase):
                 state["uploaded"][sync_youtube.file_key(missing)]["video_id"],
                 "new-video",
             )
+
+    def test_main_forced_rich_uses_progress_reporter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            video = root / "GH010084.MP4"
+            state_path = root / "state.json"
+            secrets_path = root / "secrets.json"
+            token_path = root / "token.json"
+            for path in (video, secrets_path):
+                path.write_bytes(b"x")
+
+            progress = CapturingProgress()
+
+            def fake_upload_video(**kwargs):
+                kwargs["progress_callback"](0.5)
+                return "new-video"
+
+            argv = [
+                "sync_youtube.py",
+                "--progress",
+                "rich",
+                "--state",
+                str(state_path),
+                "--secrets",
+                str(secrets_path),
+                "--token",
+                str(token_path),
+                str(root),
+            ]
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), mock.patch.object(
+                sys, "argv", argv
+            ), mock.patch.object(
+                sync_youtube, "get_youtube_client", return_value=object()
+            ), mock.patch.object(
+                sync_youtube, "make_upload_progress", return_value=progress
+            ), mock.patch.object(
+                sync_youtube, "upload_video", side_effect=fake_upload_video
+            ):
+                exit_code = sync_youtube.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(progress.entered)
+            self.assertEqual(progress.uploads, [(1, 1, video)])
+            self.assertEqual(progress.updates, [0.5])
+            self.assertEqual(progress.finished, ["new-video"])
+            self.assertNotIn("[1/1] uploading", stdout.getvalue())
 
     def test_main_stops_cleanly_on_upload_limit_without_marking_failed_video(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -433,6 +533,35 @@ class SyncYoutubeTests(unittest.TestCase):
         self.assertEqual(video_id, "abc123")
         self.assertEqual(youtube.insert_kwargs["part"], "snippet,status")
         self.assertEqual(youtube.insert_kwargs["body"]["snippet"]["title"], "GH010084")
+
+    def test_upload_video_reports_progress_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = pathlib.Path(tmp) / "GH010084.MP4"
+            video.write_bytes(b"x")
+            youtube = FakeVideoInsertYoutube(
+                FakeUploadRequest(
+                    [
+                        (FakeUploadStatus(0.25), None),
+                        (FakeUploadStatus(0.75), None),
+                        (None, {"id": "abc123"}),
+                    ]
+                )
+            )
+            progress_updates = []
+
+            video_id = sync_youtube.upload_video(
+                youtube,
+                video,
+                title="GH010084",
+                description="desc",
+                tags=["gopro"],
+                category_id="22",
+                privacy="private",
+                progress_callback=progress_updates.append,
+            )
+
+        self.assertEqual(video_id, "abc123")
+        self.assertEqual(progress_updates, [0.25, 0.75])
 
     def test_upload_video_raises_when_response_has_no_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -813,6 +942,98 @@ class FakeUploadRequest:
         if isinstance(chunk, Exception):
             raise chunk
         return chunk
+
+
+class FakeUploadStatus:
+    def __init__(self, progress):
+        self._progress = progress
+
+    def progress(self):
+        return self._progress
+
+
+class FakeStream:
+    def __init__(self, is_tty):
+        self._is_tty = is_tty
+
+    def isatty(self):
+        return self._is_tty
+
+
+class CapturingProgress:
+    def __init__(self):
+        self.entered = False
+        self.statuses = []
+        self.uploads = []
+        self.updates = []
+        self.finished = []
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return None
+
+    def status(self, message):
+        self.statuses.append(message)
+        return contextlib.nullcontext()
+
+    def start_upload(self, index, total, path):
+        self.uploads.append((index, total, path))
+
+    def update_upload(self, progress):
+        self.updates.append(progress)
+
+    def finish_upload(self, video_id):
+        self.finished.append(video_id)
+
+
+class FakeRichColumn:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class FakeRichConsole:
+    def __init__(self):
+        self.statuses = []
+        self.lines = []
+
+    def status(self, message):
+        self.statuses.append(message)
+        return contextlib.nullcontext()
+
+    def print(self, message):
+        self.lines.append(message)
+
+
+class FakeRichProgress:
+    def __init__(self, *columns, console):
+        self.columns = columns
+        self.console = console
+        self.started = False
+        self.stopped = False
+        self.tasks = []
+        self.removed = []
+        self.updates = []
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def add_task(self, description, total):
+        task_id = len(self.tasks) + 1
+        self.tasks.append((task_id, description, total))
+        return task_id
+
+    def remove_task(self, task_id):
+        self.removed.append(task_id)
+
+    def update(self, task_id, **kwargs):
+        self.updates.append((task_id, kwargs))
 
 
 if __name__ == "__main__":

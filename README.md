@@ -62,6 +62,10 @@ Upload five missing videos as private:
 uv run youtube-upload-sync --check-existing-account --privacy private --limit 5 /path/to/videos
 ```
 
+Interactive terminal runs show Rich progress bars automatically. For script logs,
+the CLI falls back to plain output; use `--progress rich` or `--progress plain`
+to force a mode.
+
 Upload all missing videos as unlisted:
 
 ```bash
