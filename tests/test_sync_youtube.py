@@ -256,6 +256,133 @@ class SyncYoutubeTests(unittest.TestCase):
         self.assertIsNone(upload_limit)
         self.assertNotIn("upload_limit", state)
 
+    def test_active_upload_limit_non_tty_exits_with_concise_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            video = root / "GH010084.MP4"
+            state_path = root / "state.json"
+            secrets_path = root / "secrets.json"
+            token_path = root / "token.json"
+            video.write_bytes(b"x")
+            secrets_path.write_bytes(b"x")
+            state = sync_youtube.empty_state()
+            sync_youtube.record_upload_limit(
+                state,
+                now=sync_youtube.dt.datetime(
+                    2998, 12, 31, 23, 0, tzinfo=sync_youtube.dt.timezone.utc
+                ),
+                last_account_upload_at=sync_youtube.dt.datetime(
+                    2999, 1, 1, 0, 0, tzinfo=sync_youtube.dt.timezone.utc
+                ),
+            )
+            sync_youtube.save_state(state_path, state)
+
+            argv = [
+                "sync_youtube.py",
+                "--state",
+                str(state_path),
+                "--secrets",
+                str(secrets_path),
+                "--token",
+                str(token_path),
+                str(root),
+            ]
+            stdout = io.StringIO()
+            stdin = mock.Mock()
+            stdin.isatty.return_value = False
+            with contextlib.redirect_stdout(stdout), mock.patch.object(
+                sys, "argv", argv
+            ), mock.patch.object(sys, "stdin", stdin), mock.patch.object(
+                sync_youtube, "get_youtube_client", return_value=object()
+            ), mock.patch.object(
+                sync_youtube,
+                "list_account_videos_by_title",
+                return_value={
+                    "latest": [
+                        {
+                            "video_id": "latest-video",
+                            "published_at": "2999-01-01T00:00:00Z",
+                        }
+                    ]
+                },
+            ), mock.patch.object(sync_youtube, "upload_video") as upload_video:
+                exit_code = sync_youtube.main()
+
+            self.assertEqual(exit_code, 2)
+            upload_video.assert_not_called()
+            output = stdout.getvalue()
+            self.assertIn("Upload limit active:", output)
+            self.assertIn("--ignore-upload-limit-wait", output)
+            self.assertNotIn("latest account upload:", output)
+            self.assertNotIn("still inside the 24-hour wait", output)
+
+    def test_active_upload_limit_tty_yes_waits_then_uploads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            video = root / "GH010084.MP4"
+            state_path = root / "state.json"
+            secrets_path = root / "secrets.json"
+            token_path = root / "token.json"
+            video.write_bytes(b"x")
+            secrets_path.write_bytes(b"x")
+            state = sync_youtube.empty_state()
+            sync_youtube.record_upload_limit(
+                state,
+                now=sync_youtube.dt.datetime(
+                    2998, 12, 31, 23, 0, tzinfo=sync_youtube.dt.timezone.utc
+                ),
+                last_account_upload_at=sync_youtube.dt.datetime(
+                    2999, 1, 1, 0, 0, tzinfo=sync_youtube.dt.timezone.utc
+                ),
+            )
+            sync_youtube.save_state(state_path, state)
+
+            argv = [
+                "sync_youtube.py",
+                "--state",
+                str(state_path),
+                "--secrets",
+                str(secrets_path),
+                "--token",
+                str(token_path),
+                str(root),
+            ]
+            stdout = io.StringIO()
+            stdin = mock.Mock()
+            stdin.isatty.return_value = True
+            with contextlib.redirect_stdout(stdout), mock.patch.object(
+                sys, "argv", argv
+            ), mock.patch.object(sys, "stdin", stdin), mock.patch(
+                "builtins.input", return_value="yes"
+            ), mock.patch.object(
+                sync_youtube, "time"
+            ) as time_module, mock.patch.object(
+                sync_youtube, "get_youtube_client", return_value=object()
+            ), mock.patch.object(
+                sync_youtube,
+                "list_account_videos_by_title",
+                return_value={
+                    "latest": [
+                        {
+                            "video_id": "latest-video",
+                            "published_at": "2999-01-01T00:00:00Z",
+                        }
+                    ]
+                },
+            ), mock.patch.object(
+                sync_youtube, "upload_video", return_value="new-video"
+            ):
+                exit_code = sync_youtube.main()
+
+            self.assertEqual(exit_code, 0)
+            time_module.sleep.assert_called_once()
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("upload_limit", state)
+            self.assertEqual(
+                state["uploaded"][sync_youtube.file_key(video)]["video_id"],
+                "new-video",
+            )
+
 
 class FakeYoutube:
     def __init__(self, pages):

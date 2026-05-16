@@ -113,6 +113,10 @@ When YouTube returns `uploadLimitExceeded`, the CLI refreshes your account
 uploads, finds the latest upload timestamp, and estimates the next retry time as
 24 hours after that latest upload. The failed video is not marked as uploaded.
 
+If the saved wait is still active during an interactive run, the CLI asks if you
+want it to wait until the retry time and continue automatically. In
+non-interactive runs, it prints the retry time and exits instead of waiting.
+
 If you want to try anyway:
 
 ```bash
