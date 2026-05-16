@@ -239,7 +239,8 @@ def get_youtube_client(secrets_path: pathlib.Path, token_path: pathlib.Path):
 
 
 def is_upload_limit_error(error: Exception) -> bool:
-    return "uploadLimitExceeded" in str(error)
+    error_text = str(error)
+    return "uploadLimitExceeded" in error_text or "quotaExceeded" in error_text
 
 
 def parse_datetime(value: str) -> dt.datetime:
@@ -266,19 +267,21 @@ def record_upload_limit(
     last_account_upload_at: dt.datetime | None = None,
 ) -> dict[str, str]:
     hit_at = now or utcnow()
-    basis_time = last_account_upload_at or hit_at
-    retry_after = basis_time + dt.timedelta(hours=24)
     upload_limit = {
         "hit_at": hit_at.isoformat(),
-        "retry_after": retry_after.isoformat(),
-        "basis": (
-            "24 hours after the latest account upload"
-            if last_account_upload_at
-            else "24 hours after the upload-limit error"
-        ),
+        "basis": "upload-limit error timestamp; no active wait estimate",
     }
     if last_account_upload_at:
         upload_limit["last_account_upload_at"] = last_account_upload_at.isoformat()
+        retry_after = last_account_upload_at + dt.timedelta(hours=24)
+        if hit_at < retry_after:
+            upload_limit["retry_after"] = retry_after.isoformat()
+            upload_limit["basis"] = "24 hours after the latest account upload"
+        else:
+            upload_limit["basis"] = (
+                "upload-limit error timestamp; latest account upload is outside "
+                "the 24-hour window"
+            )
     state["upload_limit"] = upload_limit
     return upload_limit
 
@@ -310,7 +313,9 @@ def refresh_upload_limit_from_account(
     current_time = now or utcnow()
     retry_after = last_upload_at + dt.timedelta(hours=24)
     if current_time >= retry_after:
-        state.pop("upload_limit", None)
+        upload_limit = state.get("upload_limit")
+        if isinstance(upload_limit, dict) and "retry_after" in upload_limit:
+            state.pop("upload_limit", None)
         return None
 
     upload_limit = {
@@ -351,6 +356,23 @@ def get_active_upload_limit(
 def print_upload_limit_status(state: dict[str, Any]) -> bool:
     active_limit = get_active_upload_limit(state)
     if not active_limit:
+        upload_limit = state.get("upload_limit")
+        if isinstance(upload_limit, dict) and upload_limit.get("hit_at"):
+            hit_at = parse_datetime(upload_limit["hit_at"]).astimezone()
+            print("no active upload-limit wait saved")
+            print(
+                "last upload-limit error: "
+                f"{hit_at.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+            )
+            if upload_limit.get("last_account_upload_at"):
+                last_upload = parse_datetime(
+                    upload_limit["last_account_upload_at"]
+                ).astimezone()
+                print(
+                    "latest account upload: "
+                    f"{last_upload.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+            return False
         print("no active upload-limit wait saved")
         return False
 
@@ -394,6 +416,10 @@ def refresh_and_print_upload_limit_status(youtube, state: dict[str, Any]) -> boo
     if upload_limit:
         return print_upload_limit_status(state)
 
+    saved_upload_limit = state.get("upload_limit")
+    if isinstance(saved_upload_limit, dict) and saved_upload_limit.get("hit_at"):
+        return print_upload_limit_status(state)
+
     last_upload_at = latest_account_upload_at(account_videos)
     if last_upload_at:
         retry_after = last_upload_at + dt.timedelta(hours=24)
@@ -420,7 +446,7 @@ def upload_video(
     category_id: str,
     privacy: str,
 ) -> str:
-    from googleapiclient.errors import HttpError
+    from googleapiclient.errors import HttpError, ResumableUploadError
     from googleapiclient.http import MediaFileUpload
 
     body = {
@@ -444,7 +470,7 @@ def upload_video(
     while response is None:
         try:
             status, response = request.next_chunk()
-        except HttpError as error:
+        except (HttpError, ResumableUploadError) as error:
             if is_upload_limit_error(error):
                 raise UploadLimitExceeded(
                     "YouTube says this account has exceeded the number of videos "
@@ -452,7 +478,7 @@ def upload_video(
                     "account-matched skips remain saved; rerun the same command "
                     "later to continue."
                 ) from error
-            if error.resp.status in {500, 502, 503, 504}:
+            if isinstance(error, HttpError) and error.resp.status in {500, 502, 503, 504}:
                 print(f"temporary YouTube error {error.resp.status}; retrying...")
                 time.sleep(5)
                 continue
@@ -666,16 +692,25 @@ def main() -> int:
                 state, last_account_upload_at=last_upload_at
             )
             save_state(state_path, state)
-            retry_after = parse_datetime(upload_limit["retry_after"]).astimezone()
-            remaining = format_duration(
-                (parse_datetime(upload_limit["retry_after"]) - utcnow()).total_seconds()
-            )
             print(f"upload stopped: {error}", file=sys.stderr)
-            print(
-                f"estimated wait: about {remaining}; try again after "
-                f"{retry_after.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-                file=sys.stderr,
-            )
+            if upload_limit.get("retry_after"):
+                retry_after = parse_datetime(upload_limit["retry_after"]).astimezone()
+                remaining = format_duration(
+                    (
+                        parse_datetime(upload_limit["retry_after"]) - utcnow()
+                    ).total_seconds()
+                )
+                print(
+                    f"estimated wait: about {remaining}; try again after "
+                    f"{retry_after.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "no active wait estimate saved; latest account upload is not "
+                    "inside a 24-hour window",
+                    file=sys.stderr,
+                )
             return 2
 
         if args.playlist_id:

@@ -95,7 +95,8 @@ class SyncYoutubeTests(unittest.TestCase):
 
     def test_is_upload_limit_error_detects_reason_text(self):
         self.assertTrue(sync_youtube.is_upload_limit_error(Exception("uploadLimitExceeded")))
-        self.assertFalse(sync_youtube.is_upload_limit_error(Exception("quotaExceeded")))
+        self.assertTrue(sync_youtube.is_upload_limit_error(Exception("quotaExceeded")))
+        self.assertFalse(sync_youtube.is_upload_limit_error(Exception("dailyLimitExceeded")))
 
     def test_list_account_videos_by_title_handles_pages(self):
         youtube = FakeYoutube(
@@ -264,6 +265,22 @@ class SyncYoutubeTests(unittest.TestCase):
 
         self.assertIsNone(active_limit)
 
+    def test_upload_limit_timestamp_only_when_latest_upload_is_old(self):
+        hit_at = sync_youtube.dt.datetime(
+            2026, 5, 16, 12, 0, tzinfo=sync_youtube.dt.timezone.utc
+        )
+        last_upload_at = hit_at - sync_youtube.dt.timedelta(hours=25)
+        state = sync_youtube.empty_state()
+
+        upload_limit = sync_youtube.record_upload_limit(
+            state,
+            now=hit_at,
+            last_account_upload_at=last_upload_at,
+        )
+
+        self.assertNotIn("retry_after", upload_limit)
+        self.assertIsNone(sync_youtube.get_active_upload_limit(state, now=hit_at))
+
     def test_refresh_upload_limit_uses_latest_account_upload(self):
         state = sync_youtube.empty_state()
         now = sync_youtube.dt.datetime(
@@ -347,6 +364,42 @@ class SyncYoutubeTests(unittest.TestCase):
         self.assertFalse(active)
         self.assertIn("no account uploads found", stdout.getvalue())
 
+    def test_refresh_and_print_upload_limit_status_keeps_timestamp_only_state(self):
+        state = sync_youtube.empty_state()
+        sync_youtube.record_upload_limit(
+            state,
+            now=sync_youtube.dt.datetime(
+                2026, 5, 16, 12, 0, tzinfo=sync_youtube.dt.timezone.utc
+            ),
+            last_account_upload_at=sync_youtube.dt.datetime(
+                2026, 5, 15, 10, 0, tzinfo=sync_youtube.dt.timezone.utc
+            ),
+        )
+        youtube = FakeYoutube(
+            pages=[
+                {
+                    "items": [
+                        {
+                            "snippet": {
+                                "title": "old",
+                                "publishedAt": "2026-05-15T10:00:00Z",
+                                "resourceId": {"videoId": "old-video"},
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            active = sync_youtube.refresh_and_print_upload_limit_status(youtube, state)
+
+        self.assertFalse(active)
+        self.assertIn("upload_limit", state)
+        self.assertNotIn("retry_after", state["upload_limit"])
+        self.assertIn("last upload-limit error:", stdout.getvalue())
+
     def test_add_to_playlist_inserts_playlist_item(self):
         youtube = FakePlaylistInsertYoutube()
 
@@ -397,6 +450,90 @@ class SyncYoutubeTests(unittest.TestCase):
                     category_id="22",
                     privacy="private",
                 )
+
+    def test_upload_video_handles_resumable_quota_error(self):
+        from googleapiclient.errors import ResumableUploadError
+
+        class FakeResponse:
+            status = 403
+            reason = "Forbidden"
+
+        content = json.dumps(
+            {
+                "error": {
+                    "message": "quota exceeded",
+                    "errors": [{"reason": "quotaExceeded"}],
+                }
+            }
+        ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video = pathlib.Path(tmp) / "GH010084.MP4"
+            video.write_bytes(b"x")
+            youtube = FakeVideoInsertYoutube(
+                FakeUploadRequest([ResumableUploadError(FakeResponse(), content)])
+            )
+
+            with self.assertRaises(sync_youtube.UploadLimitExceeded):
+                sync_youtube.upload_video(
+                    youtube,
+                    video,
+                    title="GH010084",
+                    description="desc",
+                    tags=[],
+                    category_id="22",
+                    privacy="private",
+                )
+
+    def test_main_records_timestamp_only_for_old_latest_upload_after_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            video = root / "GH010084.MP4"
+            state_path = root / "state.json"
+            secrets_path = root / "secrets.json"
+            token_path = root / "token.json"
+            for path in (video, secrets_path):
+                path.write_bytes(b"x")
+
+            argv = [
+                "sync_youtube.py",
+                "--state",
+                str(state_path),
+                "--secrets",
+                str(secrets_path),
+                "--token",
+                str(token_path),
+                str(root),
+            ]
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), mock.patch.object(
+                sys, "argv", argv
+            ), mock.patch.object(
+                sync_youtube, "get_youtube_client", return_value=object()
+            ), mock.patch.object(
+                sync_youtube,
+                "list_account_videos_by_title",
+                return_value={
+                    "old": [
+                        {
+                            "video_id": "old-video",
+                            "published_at": "2000-01-01T00:00:00Z",
+                        }
+                    ]
+                },
+            ), mock.patch.object(
+                sync_youtube,
+                "upload_video",
+                side_effect=sync_youtube.UploadLimitExceeded("quota hit"),
+            ):
+                exit_code = sync_youtube.main()
+
+            self.assertEqual(exit_code, 2)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn(sync_youtube.file_key(video), state["uploaded"])
+            self.assertIn("upload_limit", state)
+            self.assertNotIn("retry_after", state["upload_limit"])
+            self.assertIn("no active wait estimate saved", stderr.getvalue())
 
     def test_active_upload_limit_non_tty_exits_with_concise_output(self):
         with tempfile.TemporaryDirectory() as tmp:
