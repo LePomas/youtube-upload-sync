@@ -356,6 +356,30 @@ def print_upload_limit_status(state: dict[str, Any]) -> bool:
     return True
 
 
+def print_upload_limit_summary(active_limit: dict[str, Any]) -> None:
+    retry_after = active_limit["retry_after"].astimezone()
+    remaining = format_duration(active_limit["remaining_seconds"])
+    print(f"Upload limit active: about {remaining} remaining.")
+    print(f"Retry after: {retry_after.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print("To try now anyway, rerun with --ignore-upload-limit-wait.")
+
+
+def prompt_auto_retry() -> bool:
+    if not sys.stdin.isatty():
+        return False
+
+    answer = input("Wait until retry time and continue automatically? [y/N] ")
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def wait_until_retry_time(active_limit: dict[str, Any]) -> None:
+    remaining_seconds = max(0, active_limit["remaining_seconds"])
+    retry_after = active_limit["retry_after"].astimezone()
+    print(f"Waiting until {retry_after.strftime('%Y-%m-%d %H:%M:%S %Z')}...")
+    if remaining_seconds:
+        time.sleep(remaining_seconds)
+
+
 def refresh_and_print_upload_limit_status(youtube, state: dict[str, Any]) -> bool:
     account_videos = list_account_videos_by_title(youtube)
     upload_limit = refresh_upload_limit_from_account(state, account_videos)
@@ -563,19 +587,17 @@ def main() -> int:
 
     active_limit = get_active_upload_limit(state)
     if active_limit and not args.ignore_upload_limit_wait:
-        print("checking latest account upload before enforcing saved upload-limit wait...")
         account_videos = list_account_videos_by_title(youtube)
         refresh_upload_limit_from_account(state, account_videos)
         save_state(state_path, state)
-        if get_active_upload_limit(state):
-            print_upload_limit_status(state)
-            print(
-                "latest account upload is still inside the 24-hour wait; use "
-                "--ignore-upload-limit-wait to try anyway",
-                file=sys.stderr,
-            )
-            return 2
-        print("latest account upload is older than 24 hours; continuing")
+        active_limit = get_active_upload_limit(state)
+        if active_limit:
+            print_upload_limit_summary(active_limit)
+            if not prompt_auto_retry():
+                return 2
+            wait_until_retry_time(active_limit)
+            state.pop("upload_limit", None)
+            save_state(state_path, state)
 
     if args.check_existing_account and not args.force:
         print("checking existing videos in your YouTube account...")
