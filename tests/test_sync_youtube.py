@@ -48,6 +48,55 @@ class SyncYoutubeTests(unittest.TestCase):
             self.assertIn("GH010084", title)
             self.assertTrue(title.endswith("0.0"))
 
+    def test_load_state_rejects_invalid_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = pathlib.Path(tmp) / "state.json"
+            state_path.write_text(json.dumps({"uploaded": []}), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                sync_youtube.load_state(state_path)
+
+    def test_discover_videos_handles_file_nonrecursive_and_missing_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            video = root / "GH010001.MP4"
+            nested = root / "nested"
+            nested.mkdir()
+            nested_video = nested / "GX010002.MP4"
+            for path in (video, nested_video):
+                path.write_bytes(b"x")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                direct = sync_youtube.discover_videos(
+                    [str(video), str(root / "missing")], {".mp4"}, recursive=False
+                )
+                nonrecursive = sync_youtube.discover_videos(
+                    [str(root)], {".mp4"}, recursive=False
+                )
+
+            self.assertEqual(direct, [video])
+            self.assertEqual(nonrecursive, [video])
+            self.assertIn("warning: skipping missing path", stderr.getvalue())
+
+    def test_parse_datetime_and_format_duration_edges(self):
+        self.assertEqual(
+            sync_youtube.parse_datetime("2026-05-16T12:00:00Z"),
+            sync_youtube.dt.datetime(
+                2026, 5, 16, 12, 0, tzinfo=sync_youtube.dt.timezone.utc
+            ),
+        )
+        self.assertEqual(
+            sync_youtube.parse_datetime("2026-05-16T12:00:00").tzinfo,
+            sync_youtube.dt.timezone.utc,
+        )
+        self.assertEqual(sync_youtube.format_duration(3600), "1h")
+        self.assertEqual(sync_youtube.format_duration(-1), "0m")
+
+    def test_is_upload_limit_error_detects_reason_text(self):
+        self.assertTrue(sync_youtube.is_upload_limit_error(Exception("uploadLimitExceeded")))
+        self.assertFalse(sync_youtube.is_upload_limit_error(Exception("quotaExceeded")))
+
     def test_list_account_videos_by_title_handles_pages(self):
         youtube = FakeYoutube(
             pages=[
@@ -255,6 +304,99 @@ class SyncYoutubeTests(unittest.TestCase):
 
         self.assertIsNone(upload_limit)
         self.assertNotIn("upload_limit", state)
+
+    def test_refresh_upload_limit_returns_none_without_account_uploads(self):
+        state = sync_youtube.empty_state()
+
+        upload_limit = sync_youtube.refresh_upload_limit_from_account(state, {})
+
+        self.assertIsNone(upload_limit)
+        self.assertEqual(state, {"uploaded": {}})
+
+    def test_print_upload_limit_status_branches(self):
+        inactive_stdout = io.StringIO()
+        with contextlib.redirect_stdout(inactive_stdout):
+            inactive = sync_youtube.print_upload_limit_status(sync_youtube.empty_state())
+
+        state = sync_youtube.empty_state()
+        last_upload_at = sync_youtube.dt.datetime(
+            2999, 1, 1, 0, 0, tzinfo=sync_youtube.dt.timezone.utc
+        )
+        sync_youtube.record_upload_limit(
+            state,
+            now=last_upload_at,
+            last_account_upload_at=last_upload_at,
+        )
+        active_stdout = io.StringIO()
+        with contextlib.redirect_stdout(active_stdout):
+            active = sync_youtube.print_upload_limit_status(state)
+
+        self.assertFalse(inactive)
+        self.assertIn("no active upload-limit wait saved", inactive_stdout.getvalue())
+        self.assertTrue(active)
+        self.assertIn("latest account upload:", active_stdout.getvalue())
+
+    def test_refresh_and_print_upload_limit_status_without_uploads(self):
+        youtube = FakeYoutube(pages=[{"items": []}])
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            active = sync_youtube.refresh_and_print_upload_limit_status(
+                youtube, sync_youtube.empty_state()
+            )
+
+        self.assertFalse(active)
+        self.assertIn("no account uploads found", stdout.getvalue())
+
+    def test_add_to_playlist_inserts_playlist_item(self):
+        youtube = FakePlaylistInsertYoutube()
+
+        sync_youtube.add_to_playlist(youtube, "playlist-1", "video-1")
+
+        self.assertEqual(youtube.insert_kwargs["part"], "snippet")
+        self.assertEqual(
+            youtube.insert_kwargs["body"]["snippet"]["playlistId"], "playlist-1"
+        )
+        self.assertEqual(
+            youtube.insert_kwargs["body"]["snippet"]["resourceId"]["videoId"],
+            "video-1",
+        )
+
+    def test_upload_video_success_without_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = pathlib.Path(tmp) / "GH010084.MP4"
+            video.write_bytes(b"x")
+            youtube = FakeVideoInsertYoutube(FakeUploadRequest([(None, {"id": "abc123"})]))
+
+            video_id = sync_youtube.upload_video(
+                youtube,
+                video,
+                title="GH010084",
+                description="desc",
+                tags=["gopro"],
+                category_id="22",
+                privacy="private",
+            )
+
+        self.assertEqual(video_id, "abc123")
+        self.assertEqual(youtube.insert_kwargs["part"], "snippet,status")
+        self.assertEqual(youtube.insert_kwargs["body"]["snippet"]["title"], "GH010084")
+
+    def test_upload_video_raises_when_response_has_no_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = pathlib.Path(tmp) / "GH010084.MP4"
+            video.write_bytes(b"x")
+            youtube = FakeVideoInsertYoutube(FakeUploadRequest([(None, {})]))
+
+            with self.assertRaises(RuntimeError):
+                sync_youtube.upload_video(
+                    youtube,
+                    video,
+                    title="GH010084",
+                    description="desc",
+                    tags=[],
+                    category_id="22",
+                    privacy="private",
+                )
 
     def test_active_upload_limit_non_tty_exits_with_concise_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,6 +638,44 @@ class FakeExecute:
 
     def execute(self):
         return self.response
+
+
+class FakePlaylistInsertYoutube:
+    def __init__(self):
+        self.insert_kwargs = None
+
+    def playlistItems(self):
+        return self
+
+    def insert(self, **kwargs):
+        self.insert_kwargs = kwargs
+        return FakeExecute({})
+
+
+class FakeVideoInsertYoutube:
+    def __init__(self, request):
+        self.request = request
+        self.insert_kwargs = None
+
+    def videos(self):
+        return self
+
+    def insert(self, **kwargs):
+        self.insert_kwargs = kwargs
+        return self.request
+
+
+class FakeUploadRequest:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def next_chunk(self):
+        if not self.chunks:
+            raise AssertionError("next_chunk called too many times")
+        chunk = self.chunks.pop(0)
+        if isinstance(chunk, Exception):
+            raise chunk
+        return chunk
 
 
 if __name__ == "__main__":
