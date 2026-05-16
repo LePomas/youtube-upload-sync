@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - run: uv sync
+
+      - run: uv run python -m py_compile sync_youtube.py tests/test_sync_youtube.py
+
+      - run: uv run python -m unittest discover -v

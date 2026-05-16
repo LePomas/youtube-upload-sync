@@ -1,0 +1,38 @@
+# OAuth credentials and local sync state
+secrets.json
+token.json
+.youtube-upload-state.json
+.youtube-upload-state.json.tmp
+
+# Python and uv
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local logs and scratch files
+*.log
+.DS_Store
+.agents/
+.codex/
+
+# Personal media should not be committed to this code repository.
+*.MP4
+*.M4V
+*.MOV
+*.AVI
+*.MKV
+*.JPG
+*.JPEG
+*.PNG
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
