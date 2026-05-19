@@ -138,7 +138,9 @@ class SyncYoutubeTests(unittest.TestCase):
                 with active.status("checking..."):
                     pass
                 active.start_upload(1, 2, pathlib.Path("/tmp/GH010001.MP4"))
-                active.update_upload(0.5)
+                active.update_upload(0.1)
+                active.update_upload(0.55)
+                active.update_upload(0.9)
                 active.start_upload(2, 2, pathlib.Path("/tmp/GH010002.MP4"))
                 active.finish_upload("video-2")
 
@@ -146,9 +148,15 @@ class SyncYoutubeTests(unittest.TestCase):
         self.assertTrue(progress.progress.stopped)
         self.assertEqual(progress.progress.removed, [1, 2])
         self.assertEqual(
-            progress.progress.updates,
-            [(2, {"completed": 50.0}), (3, {"completed": 100})],
+            [task_id for task_id, _ in progress.progress.updates],
+            [2, 2, 2, 3],
         )
+        completed = [
+            update["completed"] for _, update in progress.progress.updates
+        ]
+        self.assertEqual(completed[-1], 100)
+        for actual, expected in zip(completed[:3], [10.0, 55.0, 90.0]):
+            self.assertAlmostEqual(actual, expected)
         self.assertEqual(progress.console.lines, ["  uploaded: https://youtu.be/video-2"])
 
     def test_plain_upload_progress_writes_deterministic_lines(self):
@@ -286,7 +294,9 @@ class SyncYoutubeTests(unittest.TestCase):
             progress = CapturingProgress()
 
             def fake_upload_video(**kwargs):
-                kwargs["progress_callback"](0.5)
+                kwargs["progress_callback"](0.1)
+                kwargs["progress_callback"](0.55)
+                kwargs["progress_callback"](0.9)
                 return "new-video"
 
             argv = [
@@ -316,7 +326,7 @@ class SyncYoutubeTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(progress.entered)
             self.assertEqual(progress.uploads, [(1, 1, video)])
-            self.assertEqual(progress.updates, [0.5])
+            self.assertEqual(progress.updates, [0.1, 0.55, 0.9])
             self.assertEqual(progress.finished, ["new-video"])
             self.assertNotIn("[1/1] uploading", stdout.getvalue())
 
@@ -606,6 +616,34 @@ class SyncYoutubeTests(unittest.TestCase):
         self.assertEqual(video_id, "abc123")
         self.assertEqual(youtube.insert_kwargs["part"], "snippet,status")
         self.assertEqual(youtube.insert_kwargs["body"]["snippet"]["title"], "GH010084")
+
+    def test_upload_video_uses_chunked_resumable_media_for_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = pathlib.Path(tmp) / "GH010084.MP4"
+            video.write_bytes(b"x")
+            youtube = FakeVideoInsertYoutube(FakeUploadRequest([(None, {"id": "abc123"})]))
+
+            with mock.patch(
+                "googleapiclient.http.MediaFileUpload", return_value="media"
+            ) as media_file_upload:
+                video_id = sync_youtube.upload_video(
+                    youtube,
+                    video,
+                    title="GH010084",
+                    description="desc",
+                    tags=["gopro"],
+                    category_id="22",
+                    privacy="private",
+                )
+
+        self.assertEqual(video_id, "abc123")
+        media_file_upload.assert_called_once_with(
+            str(video),
+            mimetype="video/mp4",
+            chunksize=sync_youtube.UPLOAD_CHUNK_SIZE,
+            resumable=True,
+        )
+        self.assertEqual(youtube.insert_kwargs["media_body"], "media")
 
     def test_upload_video_reports_progress_callback(self):
         with tempfile.TemporaryDirectory() as tmp:

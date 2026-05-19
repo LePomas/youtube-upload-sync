@@ -22,6 +22,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
 DEFAULT_VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".avi", ".mkv")
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 class UploadLimitExceeded(RuntimeError):
@@ -569,7 +570,9 @@ def upload_video(
         "status": {"privacyStatus": privacy},
     }
     mimetype = mimetypes.guess_type(path.name)[0] or "video/mp4"
-    media = MediaFileUpload(str(path), mimetype=mimetype, chunksize=-1, resumable=True)
+    media = MediaFileUpload(
+        str(path), mimetype=mimetype, chunksize=UPLOAD_CHUNK_SIZE, resumable=True
+    )
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,
