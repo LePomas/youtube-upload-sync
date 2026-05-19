@@ -151,6 +151,40 @@ class SyncYoutubeTests(unittest.TestCase):
         )
         self.assertEqual(progress.console.lines, ["  uploaded: https://youtu.be/video-2"])
 
+    def test_plain_upload_progress_writes_deterministic_lines(self):
+        progress = sync_youtube.PlainUploadProgress()
+        stdout = io.StringIO()
+        path = pathlib.Path("/tmp/GH010084.MP4")
+
+        with contextlib.redirect_stdout(stdout):
+            with progress as active:
+                with active.status("checking account..."):
+                    pass
+                active.start_upload(1, 3, path)
+                active.update_upload(0.375)
+                active.finish_upload("video-1")
+
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "checking account...",
+                "[1/3] uploading /tmp/GH010084.MP4",
+                "  progress: 37.5%",
+                "  uploaded: https://youtu.be/video-1",
+            ],
+        )
+
+    def test_rich_progress_status_removes_task_when_body_raises(self):
+        progress = FakeRichProgress(console=FakeRichConsole())
+        status = sync_youtube.RichProgressStatus(progress, "checking...")
+
+        with self.assertRaises(RuntimeError):
+            with status:
+                raise RuntimeError("boom")
+
+        self.assertEqual(progress.tasks, [(1, "checking...", None)])
+        self.assertEqual(progress.removed, [1])
+
     def test_list_account_videos_by_title_handles_pages(self):
         youtube = FakeYoutube(
             pages=[
@@ -285,6 +319,45 @@ class SyncYoutubeTests(unittest.TestCase):
             self.assertEqual(progress.updates, [0.5])
             self.assertEqual(progress.finished, ["new-video"])
             self.assertNotIn("[1/1] uploading", stdout.getvalue())
+
+    def test_main_auto_progress_uses_plain_reporter_for_non_tty_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            video = root / "GH010084.MP4"
+            state_path = root / "state.json"
+            secrets_path = root / "secrets.json"
+            token_path = root / "token.json"
+            for path in (video, secrets_path):
+                path.write_bytes(b"x")
+            progress = CapturingProgress()
+
+            argv = [
+                "sync_youtube.py",
+                "--state",
+                str(state_path),
+                "--secrets",
+                str(secrets_path),
+                "--token",
+                str(token_path),
+                str(root),
+            ]
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), mock.patch.object(
+                sys, "argv", argv
+            ), mock.patch.object(
+                sync_youtube, "get_youtube_client", return_value=object()
+            ), mock.patch.object(
+                sync_youtube, "make_upload_progress", return_value=progress
+            ) as make_upload_progress, mock.patch.object(
+                sync_youtube, "upload_video", return_value="new-video"
+            ):
+                exit_code = sync_youtube.main()
+
+            self.assertEqual(exit_code, 0)
+            make_upload_progress.assert_called_once_with("plain")
+            self.assertTrue(progress.entered)
+            self.assertEqual(progress.uploads, [(1, 1, video)])
+            self.assertEqual(progress.finished, ["new-video"])
 
     def test_main_stops_cleanly_on_upload_limit_without_marking_failed_video(self):
         with tempfile.TemporaryDirectory() as tmp:
